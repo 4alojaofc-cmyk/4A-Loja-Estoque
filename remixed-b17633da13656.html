@@ -1,0 +1,751 @@
+import { useState, useEffect, useRef, useCallback } from "react";
+
+// ─── CONSTANTES ───────────────────────────────────────────
+const FILE_NAME = "4a_loja_dados.json";
+const COLORS = ['#1a4fcc','#0a6b3c','#c05621','#7c3aed','#be185d','#0e7490','#15803d','#92400e'];
+const BGS = ['#e8eeff','#e8f7ee','#fff7ed','#f5f3ff','#fdf2f8','#ecfeff','#f0fdf4','#fffbeb'];
+const MOTIVOS = ['Produto com defeito','Produto errado enviado','Arrependimento do cliente','Produto avariado no transporte','Produto não chegou','Divergência de descrição','Troca de tamanho/cor','Outro'];
+const PRODS_INIT = {
+  'p1775075688222':{nome:'Mesa Laguna Redonda Off White',preco:109,inicial:0},
+  'p1775076307316':{nome:'Conjunto de Cadeiras e Mesa Romana Chocolate',preco:218,inicial:0},
+  'p1775075184087':{nome:'Penteadeira Livia Branco',preco:400.81,inicial:0},
+  'p1775073979109':{nome:'Cama Magia',preco:244.14,inicial:0},
+  'p1775075009977':{nome:'Colchão Juvenil',preco:75,inicial:0},
+};
+const CANAIS_INIT = {ml:{nome:'Mercado Livre',cor:0},shopee:{nome:'Shopee',cor:1},amazon:{nome:'Amazon',cor:2},loja:{nome:'Loja Própria',cor:3}};
+
+const EMPTY_STATE = {
+  products: {...PRODS_INIT},
+  canais: {...CANAIS_INIT},
+  movs: [], devolucoes: [], responsaveis: [],
+  motivosAjuste: ['Contagem física','Correção de erro','Perda/Avaria','Brinde/Amostra','Inventário','Entrada sem nota','Saída sem nota','Outro'],
+  romaneios: [], kits: [],
+  _versao: '4a_loja_v2'
+};
+
+// ─── GOOGLE DRIVE API (via Claude MCP) ───────────────────
+async function driveListFile() {
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 1000,
+        system: "Você é um assistente que usa o Google Drive MCP. Quando solicitado, liste arquivos e retorne SOMENTE JSON válido, sem markdown, sem explicação.",
+        messages: [{ role: "user", content: `Use a ferramenta do Google Drive para listar arquivos com query: name='${FILE_NAME}'. Retorne SOMENTE este JSON: {"fileId": "id_do_arquivo_ou_null", "found": true_ou_false}` }],
+        mcp_servers: [{ type: "url", url: "https://drivemcp.googleapis.com/mcp/v1", name: "gdrive" }]
+      })
+    });
+    const data = await res.json();
+    const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    return { found: false, fileId: null };
+  } catch { return { found: false, fileId: null }; }
+}
+
+async function driveReadFile(fileId) {
+  try {
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 8000,
+        system: "Você usa Google Drive MCP. Leia o arquivo e retorne SOMENTE o conteúdo JSON do arquivo, sem nenhum texto adicional, sem markdown.",
+        messages: [{ role: "user", content: `Leia o conteúdo do arquivo com ID: ${fileId} no Google Drive e retorne SOMENTE o JSON puro do arquivo.` }],
+        mcp_servers: [{ type: "url", url: "https://drivemcp.googleapis.com/mcp/v1", name: "gdrive" }]
+      })
+    });
+    const data = await res.json();
+    const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    return null;
+  } catch { return null; }
+}
+
+async function driveSaveFile(conteudo, fileId = null) {
+  try {
+    const jsonStr = JSON.stringify(conteudo, null, 2);
+    const prompt = fileId
+      ? `Atualize o arquivo com ID ${fileId} no Google Drive com este conteúdo JSON: ${jsonStr}. Retorne SOMENTE: {"ok": true, "fileId": "${fileId}"}`
+      : `Crie um arquivo chamado "${FILE_NAME}" no Google Drive com este conteúdo JSON: ${jsonStr}. Retorne SOMENTE: {"ok": true, "fileId": "id_do_novo_arquivo"}`;
+    const res = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: "claude-sonnet-4-20250514",
+        max_tokens: 500,
+        system: "Você usa Google Drive MCP. Execute a operação solicitada e retorne SOMENTE JSON válido sem markdown.",
+        messages: [{ role: "user", content: prompt }],
+        mcp_servers: [{ type: "url", url: "https://drivemcp.googleapis.com/mcp/v1", name: "gdrive" }]
+      })
+    });
+    const data = await res.json();
+    const text = data.content?.filter(b => b.type === "text").map(b => b.text).join("") || "";
+    const clean = text.replace(/```json|```/g, "").trim();
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    return { ok: false };
+  } catch { return { ok: false }; }
+}
+
+// ─── UTILS ───────────────────────────────────────────────
+const agora = () => {
+  const n = new Date();
+  return n.toLocaleDateString('pt-BR') + ' ' + n.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'});
+};
+const fmt = v => 'R$ ' + Number(v).toLocaleString('pt-BR', {minimumFractionDigits:2,maximumFractionDigits:2});
+const codigoProd = pid => pid.replace('p','').slice(-8);
+
+function getSaldo(pid, state) {
+  const p = state.products[pid]; if (!p) return 0;
+  let s = parseInt(p.inicial) || 0;
+  (state.movs || []).forEach(m => { if (m.produto === pid) s += (m.tipo === 'entrada' ? 1 : -1) * (parseInt(m.qtd) || 0); });
+  return s;
+}
+
+function getCodigoProd(pid, state) {
+  const p = state.products[pid];
+  return p?.codigos?.length ? p.codigos[0] : codigoProd(pid);
+}
+
+function buscarPorCodigo(cod, state) {
+  const c = cod.trim().toLowerCase();
+  return Object.entries(state.products || {}).find(([pid, p]) => {
+    if (codigoProd(pid) === c || pid === c || pid.toLowerCase() === c) return true;
+    if (p.nome.toLowerCase().includes(c)) return true;
+    if (p.codigos && p.codigos.some(b => b.trim().toLowerCase() === c)) return true;
+    return false;
+  });
+}
+
+// ─── COMPONENTE PRINCIPAL ────────────────────────────────
+export default function App() {
+  const [state, setState] = useState(EMPTY_STATE);
+  const [activeTab, setActiveTab] = useState('bip');
+  const [driveStatus, setDriveStatus] = useState('idle'); // idle | loading | saving | ok | error
+  const [driveFileId, setDriveFileId] = useState(null);
+  const [lastSync, setLastSync] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [modal, setModal] = useState(null);
+  const saveTimer = useRef(null);
+  const bipRef = useRef(null);
+  const [bipModo, setBipModo] = useState('entrada');
+  const [clItens, setClItens] = useState([]);
+  const [bipBuffer, setBipBuffer] = useState('');
+  const [bipFeedback, setBipFeedback] = useState({ msg: '', tipo: '' });
+
+  // ─── DRIVE: CARREGAR ─────────────────────────────────
+  useEffect(() => {
+    async function init() {
+      setDriveStatus('loading');
+      try {
+        const { found, fileId } = await driveListFile();
+        if (found && fileId) {
+          setDriveFileId(fileId);
+          const dados = await driveReadFile(fileId);
+          if (dados && dados.products) {
+            setState({ ...EMPTY_STATE, ...dados });
+            setLastSync(new Date());
+            setDriveStatus('ok');
+            showToast('✅ Dados carregados do Google Drive!', 'ok');
+            return;
+          }
+        }
+        // arquivo não existe, salva estado inicial
+        const r = await driveSaveFile({ ...EMPTY_STATE, _savedAt: agora() });
+        if (r.ok) { setDriveFileId(r.fileId); setLastSync(new Date()); }
+        setDriveStatus('ok');
+        showToast('📂 Arquivo criado no Google Drive!', 'ok');
+      } catch (e) {
+        setDriveStatus('error');
+        showToast('❌ Erro ao conectar com Google Drive', 'error');
+      }
+    }
+    init();
+  }, []);
+
+  // ─── DRIVE: SALVAR (debounce) ─────────────────────────
+  const salvarNoDrive = useCallback((newState) => {
+    clearTimeout(saveTimer.current);
+    setDriveStatus('saving');
+    saveTimer.current = setTimeout(async () => {
+      const payload = { ...newState, _savedAt: agora(), _versao: '4a_loja_v2' };
+      const r = await driveSaveFile(payload, driveFileId);
+      if (r.ok) {
+        if (r.fileId && !driveFileId) setDriveFileId(r.fileId);
+        setLastSync(new Date());
+        setDriveStatus('ok');
+      } else {
+        setDriveStatus('error');
+        showToast('⚠ Erro ao salvar no Drive', 'error');
+      }
+    }, 1500);
+  }, [driveFileId]);
+
+  const update = useCallback((fn) => {
+    setState(prev => {
+      const next = fn(prev);
+      salvarNoDrive(next);
+      return next;
+    });
+  }, [salvarNoDrive]);
+
+  function showToast(msg, tipo = 'ok') {
+    setToast({ msg, tipo });
+    setTimeout(() => setToast(null), 3000);
+  }
+
+  // ─── BIP ─────────────────────────────────────────────
+  useEffect(() => {
+    if (activeTab === 'bip') setTimeout(() => bipRef.current?.focus(), 100);
+  }, [activeTab, bipModo]);
+
+  function handleBipKey(e) {
+    if (e.key !== 'Enter') return;
+    const val = bipBuffer.trim();
+    setBipBuffer('');
+    if (!val) return;
+    const found = buscarPorCodigo(val, state);
+    if (found) {
+      const [pid, p] = found;
+      adicionarBip(pid, p);
+    } else {
+      setBipFeedback({ msg: `❌ Código "${val}" não encontrado`, tipo: 'error' });
+      setTimeout(() => setBipFeedback({ msg: '', tipo: '' }), 2500);
+    }
+  }
+
+  function adicionarBip(pid, p) {
+    const saldo = getSaldo(pid, state);
+    if (bipModo === 'saida' && saldo <= 0) {
+      setBipFeedback({ msg: `⚠ Estoque ZERO para "${p.nome}"`, tipo: 'warn' });
+      setTimeout(() => setBipFeedback({ msg: '', tipo: '' }), 2500);
+      return;
+    }
+    setClItens(prev => {
+      const ex = prev.findIndex(i => i.pid === pid);
+      if (ex >= 0) {
+        const next = [...prev];
+        next[ex] = { ...next[ex], qty: next[ex].qty + 1 };
+        return next;
+      }
+      return [...prev, { pid, nome: p.nome, preco: p.preco || 0, qty: 1, saldo, tipo: bipModo }];
+    });
+    setBipFeedback({ msg: `✅ ${p.nome} adicionado`, tipo: 'ok' });
+    setTimeout(() => setBipFeedback({ msg: '', tipo: '' }), 1800);
+    bipRef.current?.focus();
+  }
+
+  function confirmarBip() {
+    if (!clItens.length) return;
+    update(prev => {
+      const next = { ...prev, movs: [...prev.movs] };
+      const ts = Date.now();
+      clItens.forEach((item, i) => {
+        next.movs.push({ produto: item.pid, qtd: item.qty, tipo: item.tipo, obs: '[BIP]', resp: 'Bip', dataHora: agora(), ts: ts + i });
+      });
+      return next;
+    });
+    showToast(`✅ ${clItens.length} produto(s) confirmados!`, 'ok');
+    setClItens([]);
+  }
+
+  // ─── RENDER ──────────────────────────────────────────
+  const tabs = [
+    { id: 'bip', label: '⚡ Bip' },
+    { id: 'estoque', label: '📦 Estoque' },
+    { id: 'devolucoes', label: '↩ Devoluções' },
+    { id: 'sync', label: '☁ Sincronizar' },
+  ];
+
+  const statusColors = { idle:'#888', loading:'#f59e0b', saving:'#f59e0b', ok:'#4ade80', error:'#f87171' };
+  const statusLabels = { idle:'—', loading:'Carregando...', saving:'Salvando...', ok:'Sincronizado', error:'Erro' };
+
+  return (
+    <div style={{ fontFamily: "'Inter', sans-serif", background: '#f4f3ef', minHeight: '100vh', color: '#17170e' }}>
+      {/* HEADER */}
+      <header style={{ background: '#17170e', color: '#fff', height: 56, padding: '0 22px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 100 }}>
+        <span style={{ fontSize: 15, fontWeight: 800 }}>4A Loja <span style={{ fontWeight: 400, opacity: .7 }}>Estoque & Devoluções</span></span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+          <span style={{ fontSize: 12, opacity: .7, fontFamily: 'monospace' }}>
+            {lastSync ? `Sync: ${lastSync.toLocaleTimeString('pt-BR', {hour:'2-digit',minute:'2-digit'})}` : ''}
+          </span>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 12, fontWeight: 700 }}>
+            <div style={{ width: 8, height: 8, borderRadius: '50%', background: statusColors[driveStatus] }} />
+            <span style={{ opacity: .8 }}>{statusLabels[driveStatus]}</span>
+          </div>
+        </div>
+      </header>
+
+      {/* TABS */}
+      <div style={{ background: '#fff', borderBottom: '1px solid #ddd', padding: '0 22px', display: 'flex', overflowX: 'auto' }}>
+        {tabs.map(t => (
+          <button key={t.id} onClick={() => setActiveTab(t.id)} style={{ padding: '15px 16px', fontSize: 13, fontWeight: 700, background: 'none', border: 'none', cursor: 'pointer', borderBottom: `3px solid ${activeTab === t.id ? '#0a6b3c' : 'transparent'}`, color: activeTab === t.id ? '#0a6b3c' : '#5a5950', whiteSpace: 'nowrap', fontFamily: 'Inter, sans-serif' }}>
+            {t.label}
+          </button>
+        ))}
+      </div>
+
+      {/* TOAST */}
+      {toast && (
+        <div style={{ position: 'fixed', bottom: 80, left: '50%', transform: 'translateX(-50%)', zIndex: 999, background: toast.tipo === 'error' ? '#b91c1c' : '#0a6b3c', color: '#fff', padding: '12px 22px', borderRadius: 8, fontWeight: 700, fontSize: 14, boxShadow: '0 8px 24px rgba(0,0,0,.18)', pointerEvents: 'none' }}>
+          {toast.msg}
+        </div>
+      )}
+
+      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 22px' }}>
+
+        {/* ─── BIP TAB ─────────────────────────────── */}
+        {activeTab === 'bip' && (
+          <div>
+            <div style={{ marginBottom: 16 }}>
+              <div style={{ fontSize: 20, fontWeight: 800, marginBottom: 16 }}>Leitura com bip</div>
+              {/* MODO */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: 16 }}>
+                {[['entrada','📥','Entrada','#0a6b3c','#e8f7ee'],['saida','📤','Saída','#b91c1c','#fff0f0']].map(([m, ic, lbl, cor, bg]) => (
+                  <button key={m} onClick={() => setBipModo(m)} style={{ flex: 1, padding: '14px 10px', fontSize: 14, fontWeight: 800, borderRadius: 10, cursor: 'pointer', border: `2px solid ${bipModo === m ? cor : '#ddd'}`, background: bipModo === m ? bg : '#fff', color: bipModo === m ? cor : '#888', fontFamily: 'Inter, sans-serif', transition: 'all .15s' }}>
+                    <div style={{ fontSize: 20, marginBottom: 4 }}>{ic}</div>
+                    {lbl}
+                  </button>
+                ))}
+              </div>
+
+              {/* SCANNER STATUS */}
+              <div style={{ background: '#e8f7ee', border: '2px solid #0a6b3c', borderRadius: 10, padding: '14px 18px', display: 'flex', alignItems: 'center', gap: 12, marginBottom: 10 }}>
+                <div style={{ width: 9, height: 9, borderRadius: '50%', background: '#0a6b3c', animation: 'pulse 1.5s infinite' }} />
+                <span style={{ fontWeight: 700, color: '#0a6b3c' }}>Pronto — aponte o bip para qualquer produto</span>
+              </div>
+
+              {bipFeedback.msg && (
+                <div style={{ padding: '10px 14px', borderRadius: 6, marginBottom: 10, fontWeight: 700, fontSize: 13, background: bipFeedback.tipo === 'ok' ? '#e8f7ee' : bipFeedback.tipo === 'warn' ? '#fff9eb' : '#fff0f0', color: bipFeedback.tipo === 'ok' ? '#0a6b3c' : bipFeedback.tipo === 'warn' ? '#92400e' : '#b91c1c', border: `1px solid ${bipFeedback.tipo === 'ok' ? '#9de4be' : bipFeedback.tipo === 'warn' ? '#fcd34d' : '#fca5a5'}` }}>
+                  {bipFeedback.msg}
+                </div>
+              )}
+
+              {/* INPUT INVISÍVEL */}
+              <input ref={bipRef} value={bipBuffer} onChange={e => setBipBuffer(e.target.value)} onKeyDown={handleBipKey} style={{ position: 'fixed', left: -9999, top: 0, opacity: 0 }} autoFocus />
+            </div>
+
+            {/* LISTA */}
+            <div style={{ background: '#fff', border: '1px solid #ddd', borderRadius: 10, overflow: 'hidden', marginBottom: 16 }}>
+              <div style={{ padding: '14px 18px', borderBottom: '1px solid #eee', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <span style={{ fontWeight: 800, fontSize: 14 }}>{bipModo === 'entrada' ? '📥 Lista de Entrada' : '📤 Lista de Saída'}</span>
+                {clItens.length > 0 && <button onClick={() => setClItens([])} style={{ fontSize: 12, fontWeight: 700, padding: '4px 10px', borderRadius: 5, border: '1px solid #ddd', background: '#f4f3ef', cursor: 'pointer' }}>🗑 Limpar</button>}
+              </div>
+              {clItens.length === 0 ? (
+                <div style={{ textAlign: 'center', padding: 32, color: '#999', fontWeight: 600 }}>
+                  <div style={{ fontSize: 28, marginBottom: 8 }}>📋</div>
+                  Bipe os produtos para adicioná-los
+                </div>
+              ) : (
+                <>
+                  {clItens.map((item, idx) => {
+                    const saldoAtual = getSaldo(item.pid, state);
+                    return (
+                      <div key={item.pid} style={{ display: 'grid', gridTemplateColumns: '1fr 100px 80px 36px', alignItems: 'center', padding: '10px 14px', borderTop: '1px solid #eee' }}>
+                        <div>
+                          <div style={{ fontWeight: 700 }}>{item.nome}</div>
+                          <div style={{ fontSize: 11, color: '#999', fontFamily: 'monospace', marginTop: 2 }}>
+                            Saldo: {saldoAtual} → {item.tipo === 'entrada' ? saldoAtual + item.qty : saldoAtual - item.qty}
+                          </div>
+                        </div>
+                        <div style={{ display: 'flex', alignItems: 'center', gap: 5, justifyContent: 'center' }}>
+                          <button onClick={() => setClItens(p => { const n=[...p]; if(n[idx].qty<=1){n.splice(idx,1);}else{n[idx]={...n[idx],qty:n[idx].qty-1};}return n; })} style={{ width:24,height:24,borderRadius:4,border:'1px solid #ddd',background:'#f4f3ef',cursor:'pointer',fontWeight:700 }}>−</button>
+                          <span style={{ fontFamily:'monospace',fontWeight:800,minWidth:24,textAlign:'center',color:item.tipo==='entrada'?'#0a6b3c':'#b91c1c' }}>{item.qty}</span>
+                          <button onClick={() => setClItens(p => { const n=[...p]; n[idx]={...n[idx],qty:n[idx].qty+1}; return n; })} style={{ width:24,height:24,borderRadius:4,border:'1px solid #ddd',background:'#f4f3ef',cursor:'pointer',fontWeight:700 }}>+</button>
+                        </div>
+                        <span style={{ textAlign:'center',fontSize:11,fontWeight:700,padding:'2px 7px',borderRadius:4, background:item.tipo==='entrada'?'#e8f7ee':'#fff0f0',color:item.tipo==='entrada'?'#0a6b3c':'#b91c1c',border:`1px solid ${item.tipo==='entrada'?'#9de4be':'#fca5a5'}` }}>{item.tipo==='entrada'?'▲ Entrada':'▼ Saída'}</span>
+                        <button onClick={() => setClItens(p => p.filter((_,i)=>i!==idx))} style={{ background:'none',border:'none',color:'#ccc',cursor:'pointer',fontSize:14,padding:4 }}>✕</button>
+                      </div>
+                    );
+                  })}
+                  <div style={{ padding: '12px 18px', background: bipModo==='entrada'?'#e8f7ee':'#fff0f0', borderTop: '1px solid #eee', display:'flex',justifyContent:'space-between',alignItems:'center' }}>
+                    <span style={{ fontWeight:700,color:bipModo==='entrada'?'#0a6b3c':'#b91c1c' }}>{clItens.length} produto(s) · {clItens.reduce((a,i)=>a+i.qty,0)} un.</span>
+                    <button onClick={confirmarBip} style={{ padding:'10px 22px',fontSize:14,fontWeight:800,borderRadius:8,border:'none',background:bipModo==='entrada'?'#0a6b3c':'#b91c1c',color:'#fff',cursor:'pointer' }}>
+                      ✅ Confirmar {bipModo==='entrada'?'Entrada':'Saída'}
+                    </button>
+                  </div>
+                </>
+              )}
+            </div>
+
+            {/* HISTÓRICO RÁPIDO */}
+            <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,padding:18 }}>
+              <div style={{ fontWeight:800,marginBottom:12,fontSize:14 }}>📋 Últimas movimentações</div>
+              {state.movs.length === 0 ? <div style={{ color:'#999',fontSize:13,fontWeight:600 }}>Nenhuma movimentação ainda.</div> : (
+                [...state.movs].reverse().slice(0,15).map((m, i) => {
+                  const p = state.products[m.produto];
+                  return (
+                    <div key={i} style={{ display:'flex',justifyContent:'space-between',alignItems:'center',padding:'8px 0',borderTop:'1px solid #eee' }}>
+                      <div>
+                        <div style={{ fontWeight:700,fontSize:14 }}>{p?.nome || m.produto}</div>
+                        <div style={{ fontSize:11,color:'#999',fontFamily:'monospace',marginTop:2 }}>{m.tipo==='entrada'?'Entrada':'Saída'} · {m.resp || ''}{m.obs?' — '+m.obs:''}</div>
+                      </div>
+                      <div style={{ textAlign:'right' }}>
+                        <div style={{ fontWeight:800,fontFamily:'monospace',color:m.tipo==='entrada'?'#0a6b3c':'#b91c1c' }}>{m.tipo==='entrada'?'+':'−'}{m.qtd}</div>
+                        <div style={{ fontSize:11,color:'#999',fontFamily:'monospace' }}>{m.dataHora}</div>
+                      </div>
+                    </div>
+                  );
+                })
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ─── ESTOQUE TAB ─────────────────────────── */}
+        {activeTab === 'estoque' && (
+          <EstoqueTab state={state} update={update} showToast={showToast} />
+        )}
+
+        {/* ─── DEVOLUÇÕES TAB ──────────────────────── */}
+        {activeTab === 'devolucoes' && (
+          <DevolucoesTab state={state} update={update} showToast={showToast} />
+        )}
+
+        {/* ─── SYNC TAB ────────────────────────────── */}
+        {activeTab === 'sync' && (
+          <SyncTab state={state} update={update} driveStatus={driveStatus} lastSync={lastSync} showToast={showToast} salvarNoDrive={salvarNoDrive} driveFileId={driveFileId} />
+        )}
+      </div>
+
+      <style>{`
+        @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.35} }
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        input, select, textarea { font-family: Inter, sans-serif; }
+        ::-webkit-scrollbar { width: 5px; height: 5px; }
+        ::-webkit-scrollbar-thumb { background: #c8c5bb; border-radius: 3px; }
+      `}</style>
+    </div>
+  );
+}
+
+// ─── ESTOQUE TAB ─────────────────────────────────────────
+function EstoqueTab({ state, update, showToast }) {
+  const [q, setQ] = useState('');
+  const [showAdd, setShowAdd] = useState(false);
+  const [form, setForm] = useState({ nome:'', preco:'', inicial:'', codigos:'' });
+  const [movForm, setMovForm] = useState({ pid:'', qtd:'', tipo:'entrada', resp:'', obs:'' });
+
+  function getSaldo(pid) {
+    const p = state.products[pid]; if(!p) return 0;
+    let s = parseInt(p.inicial)||0;
+    (state.movs||[]).forEach(m=>{if(m.produto===pid)s+=(m.tipo==='entrada'?1:-1)*(parseInt(m.qtd)||0);});
+    return s;
+  }
+
+  function salvarProd() {
+    if (!form.nome.trim()) return;
+    const ts = Date.now();
+    const codigos = form.codigos.trim() ? [form.codigos.trim()] : [];
+    update(prev => ({ ...prev, products: { ...prev.products, ['p'+ts]: { nome:form.nome.trim(), preco:parseFloat(form.preco)||0, inicial:parseInt(form.inicial)||0, codigos, ultimaEdicao:agora(), ultimaEdicaoTs:ts } } }));
+    setForm({nome:'',preco:'',inicial:'',codigos:''});
+    setShowAdd(false);
+    showToast('✅ Produto adicionado!', 'ok');
+  }
+
+  function regMov() {
+    if (!movForm.pid || !movForm.qtd) return;
+    const qtd = parseInt(movForm.qtd);
+    const saldo = getSaldo(movForm.pid);
+    if (movForm.tipo === 'saida' && saldo < qtd) { showToast('⚠ Saldo insuficiente!', 'error'); return; }
+    update(prev => ({ ...prev, movs: [...prev.movs, { produto:movForm.pid, qtd, tipo:movForm.tipo, obs:movForm.obs||'', resp:movForm.resp||'Não informado', dataHora:agora(), ts:Date.now() }] }));
+    setMovForm(p => ({...p, qtd:'', obs:''}));
+    showToast(`✅ ${movForm.tipo === 'entrada' ? 'Entrada' : 'Saída'} registrada!`, 'ok');
+  }
+
+  const prods = Object.entries(state.products||{}).filter(([pid,p]) => !q || p.nome.toLowerCase().includes(q.toLowerCase()) || codigoProd(pid).includes(q));
+
+  return (
+    <div>
+      <div style={{ display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:10 }}>
+        <span style={{ fontSize:20,fontWeight:800 }}>Estoque</span>
+        <button onClick={() => setShowAdd(p=>!p)} style={{ padding:'9px 16px',fontSize:13,fontWeight:700,borderRadius:6,border:'none',background:'#0a6b3c',color:'#fff',cursor:'pointer' }}>+ Produto</button>
+      </div>
+
+      {showAdd && (
+        <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,padding:18,marginBottom:16 }}>
+          <div style={{ fontWeight:800,marginBottom:14,fontSize:14 }}>+ Novo produto</div>
+          <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr 1fr 1fr',gap:10,marginBottom:12 }}>
+            {[['Nome','nome','text','Ex: Cama Magia'],['Preço (R$)','preco','number','0,00'],['Estoque inicial','inicial','number','0'],['Código de barras','codigos','text','Ex: 75688222']].map(([lbl,key,type,ph]) => (
+              <div key={key}>
+                <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>{lbl}</label>
+                <input value={form[key]} onChange={e=>setForm(p=>({...p,[key]:e.target.value}))} type={type} placeholder={ph} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} />
+              </div>
+            ))}
+          </div>
+          <div style={{ display:'flex',gap:8 }}>
+            <button onClick={salvarProd} style={{ padding:'9px 18px',fontWeight:700,fontSize:13,borderRadius:6,border:'none',background:'#0a6b3c',color:'#fff',cursor:'pointer' }}>Salvar</button>
+            <button onClick={()=>setShowAdd(false)} style={{ padding:'9px 18px',fontWeight:700,fontSize:13,borderRadius:6,border:'1px solid #ddd',background:'#fff',cursor:'pointer' }}>Cancelar</button>
+          </div>
+        </div>
+      )}
+
+      {/* BUSCA */}
+      <input value={q} onChange={e=>setQ(e.target.value)} placeholder="🔍 Buscar produto..." style={{ width:'100%',padding:'9px 12px',fontSize:14,border:'1px solid #ddd',borderRadius:6,marginBottom:14,outline:'none' }} />
+
+      {/* TABELA */}
+      <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,overflow:'auto',marginBottom:16 }}>
+        <table style={{ width:'100%',borderCollapse:'collapse',fontSize:14 }}>
+          <thead>
+            <tr style={{ background:'#f4f3ef' }}>
+              {['Produto','Preço','Saldo','Últ. mov.'].map(h => <th key={h} style={{ textAlign:'left',fontSize:11,fontWeight:700,color:'#5a5950',padding:'11px 13px',borderBottom:'1px solid #ddd',textTransform:'uppercase',letterSpacing:.5 }}>{h}</th>)}
+              <th style={{ padding:'11px 13px',borderBottom:'1px solid #ddd' }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {prods.length === 0 ? (
+              <tr><td colSpan={5} style={{ textAlign:'center',padding:32,color:'#999',fontWeight:600 }}>Nenhum produto encontrado.</td></tr>
+            ) : prods.sort((a,b)=>a[1].nome.localeCompare(b[1].nome,'pt-BR')).map(([pid,p]) => {
+              const saldo = getSaldo(pid);
+              const sc = saldo < 0 ? '#b91c1c' : saldo === 0 ? '#92400e' : saldo <= 2 ? '#f59e0b' : '#0a6b3c';
+              return (
+                <tr key={pid} style={{ borderBottom:'1px solid #eee' }}>
+                  <td style={{ padding:'11px 13px',fontWeight:700 }}>
+                    {p.nome}
+                    {p.codigos?.length && <div style={{ fontSize:11,color:'#999',fontFamily:'monospace',marginTop:2 }}>{p.codigos[0]}</div>}
+                  </td>
+                  <td style={{ padding:'11px 13px',color:'#0a6b3c',fontWeight:600 }}>{p.preco ? fmt(p.preco) : '—'}</td>
+                  <td style={{ padding:'11px 13px',fontWeight:800,fontFamily:'monospace',fontSize:16,color:sc }}>{saldo}</td>
+                  <td style={{ padding:'11px 13px',fontSize:11,color:'#999',fontFamily:'monospace' }}>{p.ultimaEdicao||'—'}</td>
+                  <td style={{ padding:'11px 13px' }}>
+                    <button onClick={() => update(prev=>{const n={...prev,products:{...prev.products}};delete n.products[pid];return n;})} style={{ background:'none',border:'none',color:'#ccc',cursor:'pointer',fontSize:13 }}>✕</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      {/* MOVIMENTAÇÃO RÁPIDA */}
+      <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,padding:18 }}>
+        <div style={{ fontWeight:800,fontSize:14,marginBottom:14 }}>⚡ Movimentação rápida</div>
+        <div style={{ display:'flex',gap:8,marginBottom:14 }}>
+          {[['entrada','+ Entrada','#0a6b3c'],['saida','− Saída','#b91c1c']].map(([t,lbl,cor]) => (
+            <button key={t} onClick={()=>setMovForm(p=>({...p,tipo:t}))} style={{ padding:'7px 16px',fontSize:13,fontWeight:700,borderRadius:6,border:`1px solid ${movForm.tipo===t?cor:'#ddd'}`,background:movForm.tipo===t?cor:'#fff',color:movForm.tipo===t?'#fff':'#888',cursor:'pointer' }}>{lbl}</button>
+          ))}
+        </div>
+        <div style={{ display:'grid',gridTemplateColumns:'2fr 80px 1fr 1fr',gap:10,marginBottom:12 }}>
+          <div>
+            <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Produto</label>
+            <select value={movForm.pid} onChange={e=>setMovForm(p=>({...p,pid:e.target.value}))} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }}>
+              <option value="">Selecione...</option>
+              {Object.entries(state.products||{}).map(([pid,p]) => <option key={pid} value={pid}>{p.nome} (saldo: {getSaldo(pid)})</option>)}
+            </select>
+          </div>
+          <div>
+            <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Qtd</label>
+            <input type="number" min="1" value={movForm.qtd} onChange={e=>setMovForm(p=>({...p,qtd:e.target.value}))} placeholder="0" style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} onKeyDown={e=>e.key==='Enter'&&regMov()} />
+          </div>
+          <div>
+            <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Responsável</label>
+            <input value={movForm.resp} onChange={e=>setMovForm(p=>({...p,resp:e.target.value}))} placeholder="Nome..." style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} />
+          </div>
+          <div>
+            <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Obs.</label>
+            <input value={movForm.obs} onChange={e=>setMovForm(p=>({...p,obs:e.target.value}))} placeholder="Opcional" style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} onKeyDown={e=>e.key==='Enter'&&regMov()} />
+          </div>
+        </div>
+        <button onClick={regMov} style={{ width:'100%',padding:'11px',fontSize:14,fontWeight:700,borderRadius:6,border:'none',background:movForm.tipo==='entrada'?'#0a6b3c':'#b91c1c',color:'#fff',cursor:'pointer' }}>
+          Registrar {movForm.tipo==='entrada'?'entrada':'saída'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── DEVOLUÇÕES TAB ──────────────────────────────────────
+function DevolucoesTab({ state, update, showToast }) {
+  const [form, setForm] = useState({ produtoId:'', qtd:'1', valorUnit:'', motivo:'Produto com defeito', canal:'', voltouEstoque:false, resp:'' });
+  const [showForm, setShowForm] = useState(false);
+
+  function salvarDev() {
+    if (!form.produtoId || !form.qtd) return;
+    const qtd = parseInt(form.qtd)||1;
+    const vu = parseFloat(form.valorUnit)||0;
+    const ts = Date.now();
+    const reg = { id:'dev_'+ts, ts, data:new Date().toLocaleDateString('pt-BR'), produtoId:form.produtoId, produto:state.products[form.produtoId]?.nome||'', canalId:form.canal, qtd, valorUnit:vu, prejuizo:qtd*vu, motivo:form.motivo, resp:form.resp||'Não informado', voltouEstoque:form.voltouEstoque };
+    update(prev => {
+      const next = { ...prev, devolucoes:[...(prev.devolucoes||[]),reg] };
+      if (form.voltouEstoque && form.motivo !== 'Produto com defeito') {
+        next.movs = [...prev.movs, { produto:form.produtoId, qtd, tipo:'entrada', obs:'[DEVOLUÇÃO] '+form.motivo, resp:form.resp||'Não informado', dataHora:agora(), ts:ts+1 }];
+      }
+      return next;
+    });
+    showToast('✅ Devolução registrada!', 'ok');
+    setShowForm(false);
+    setForm({ produtoId:'', qtd:'1', valorUnit:'', motivo:'Produto com defeito', canal:'', voltouEstoque:false, resp:'' });
+  }
+
+  const devs = (state.devolucoes||[]).slice().reverse();
+  const totalPrej = devs.reduce((a,d)=>a+(parseFloat(d.prejuizo)||0),0);
+
+  return (
+    <div>
+      <div style={{ display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:16,flexWrap:'wrap',gap:10 }}>
+        <span style={{ fontSize:20,fontWeight:800 }}>Devoluções</span>
+        <button onClick={()=>setShowForm(p=>!p)} style={{ padding:'9px 16px',fontSize:13,fontWeight:700,borderRadius:6,border:'none',background:'#1a4fcc',color:'#fff',cursor:'pointer' }}>+ Registrar devolução</button>
+      </div>
+
+      {/* TOTAIS */}
+      <div style={{ display:'grid',gridTemplateColumns:'repeat(3,1fr)',gap:10,marginBottom:16 }}>
+        {[['Total de devoluções',devs.length,''],['Unidades devolvidas',devs.reduce((a,d)=>a+(parseInt(d.qtd)||0),0),''],['💸 Prejuízo total',fmt(totalPrej),'color:#b91c1c']].map(([lbl,val,st]) => (
+          <div key={lbl} style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,padding:16 }}>
+            <div style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,marginBottom:6 }}>{lbl}</div>
+            <div style={{ fontSize:22,fontWeight:800,..( st?{color:st.replace('color:','')}:{}) }}>{val}</div>
+          </div>
+        ))}
+      </div>
+
+      {showForm && (
+        <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,padding:18,marginBottom:16 }}>
+          <div style={{ fontWeight:800,fontSize:14,marginBottom:14 }}>↩ Nova devolução</div>
+          <div style={{ display:'grid',gridTemplateColumns:'1fr 1fr',gap:10,marginBottom:10 }}>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Produto</label>
+              <select value={form.produtoId} onChange={e=>{const p=state.products[e.target.value];setForm(f=>({...f,produtoId:e.target.value,valorUnit:p?.preco||''}));}} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }}>
+                <option value="">Selecione...</option>
+                {Object.entries(state.products||{}).map(([pid,p]) => <option key={pid} value={pid}>{p.nome}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Motivo</label>
+              <select value={form.motivo} onChange={e=>setForm(f=>({...f,motivo:e.target.value}))} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }}>
+                {MOTIVOS.map(m=><option key={m}>{m}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Qtd</label>
+              <input type="number" min="1" value={form.qtd} onChange={e=>setForm(f=>({...f,qtd:e.target.value}))} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} />
+            </div>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Valor unit. (R$)</label>
+              <input type="number" min="0" step="0.01" value={form.valorUnit} onChange={e=>setForm(f=>({...f,valorUnit:e.target.value}))} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} />
+            </div>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Canal</label>
+              <select value={form.canal} onChange={e=>setForm(f=>({...f,canal:e.target.value}))} style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }}>
+                <option value="">— Canal —</option>
+                {Object.entries(state.canais||{}).map(([id,c]) => <option key={id} value={id}>{c.nome}</option>)}
+              </select>
+            </div>
+            <div>
+              <label style={{ fontSize:11,fontWeight:700,color:'#5a5950',textTransform:'uppercase',letterSpacing:.5,display:'block',marginBottom:5 }}>Responsável</label>
+              <input value={form.resp} onChange={e=>setForm(f=>({...f,resp:e.target.value}))} placeholder="Nome..." style={{ width:'100%',padding:'9px 11px',fontSize:14,border:'1px solid #ddd',borderRadius:6,outline:'none' }} />
+            </div>
+          </div>
+          {form.motivo !== 'Produto com defeito' && (
+            <label style={{ display:'flex',alignItems:'center',gap:10,cursor:'pointer',fontSize:14,fontWeight:600,background:'#e8f7ee',border:'1px solid #9de4be',borderRadius:6,padding:'10px 13px',marginBottom:12 }}>
+              <input type="checkbox" checked={form.voltouEstoque} onChange={e=>setForm(f=>({...f,voltouEstoque:e.target.checked}))} style={{ width:16,height:16,cursor:'pointer' }} />
+              Produto voltou ao estoque
+            </label>
+          )}
+          <div style={{ display:'flex',gap:8' }}>
+            <button onClick={salvarDev} style={{ padding:'9px 18px',fontWeight:700,fontSize:13,borderRadius:6,border:'none',background:'#1a4fcc',color:'#fff',cursor:'pointer' }}>Registrar</button>
+            <button onClick={()=>setShowForm(false)} style={{ padding:'9px 18px',fontWeight:700,fontSize:13,borderRadius:6,border:'1px solid #ddd',background:'#fff',cursor:'pointer' }}>Cancelar</button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ background:'#fff',border:'1px solid #ddd',borderRadius:10,overflow:'auto' }}>
+        <table style={{ width:'100%',borderCollapse:'collapse',fontSize:14 }}>
+          <thead>
+            <tr style={{ background:'#f4f3ef' }}>
+              {['Data','Produto','Qtd','Prejuízo','Canal','Motivo','Voltou?'].map(h => <th key={h} style={{ textAlign:'left',fontSize:11,fontWeight:700,color:'#5a5950',padding:'11px 13px',borderBottom:'1px solid #ddd',textTransform:'uppercase',letterSpacing:.5,whiteSpace:'nowrap' }}>{h}</th>)}
+              <th style={{ padding:'11px 13px',borderBottom:'1px solid #ddd' }}></th>
+            </tr>
+          </thead>
+          <tbody>
+            {devs.length === 0 ? (
+              <tr><td colSpan={8} style={{ textAlign:'center',padding:32,color:'#999',fontWeight:600 }}>Nenhuma devolução registrada.</td></tr>
+            ) : devs.map((d,i) => {
+              const canal = state.canais?.[d.canalId];
+              return (
+                <tr key={d.id||i} style={{ borderBottom:'1px solid #eee' }}>
+                  <td style={{ padding:'11px 13px',fontFamily:'monospace',fontSize:12,whiteSpace:'nowrap' }}>{d.data}</td>
+                  <td style={{ padding:'11px 13px',fontWeight:600 }}>{d.produto}</td>
+                  <td style={{ padding:'11px 13px',textAlign:'center',fontWeight:700 }}>{d.qtd}</td>
+                  <td style={{ padding:'11px 13px',fontWeight:700,color:'#b91c1c',fontFamily:'monospace',fontSize:13 }}>{fmt(d.prejuizo)}</td>
+                  <td style={{ padding:'11px 13px',fontSize:13,color:'#5a5950' }}>{canal?.nome||'—'}</td>
+                  <td style={{ padding:'11px 13px',fontSize:13,color:'#5a5950' }}>{d.motivo||'—'}</td>
+                  <td style={{ padding:'11px 13px',textAlign:'center' }}>{d.voltouEstoque?'✅':'❌'}</td>
+                  <td style={{ padding:'11px 13px' }}>
+                    <button onClick={()=>update(prev=>({...prev,devolucoes:(prev.devolucoes||[]).filter(x=>x.id!==d.id)}))} style={{ background:'none',border:'none',color:'#ccc',cursor:'pointer',fontSize:13 }}>✕</button>
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─── SYNC TAB ────────────────────────────────────────────
+function SyncTab({ state, update, driveStatus, lastSync, showToast, salvarNoDrive, driveFileId }) {
+  const [syncing, setSyncing] = useState(false);
+
+  async function forceSave() {
+    setSyncing(true);
+    const r = await driveSaveFile({ ...state, _savedAt: agora(), _versao: '4a_loja_v2' }, driveFileId);
+    setSyncing(false);
+    if (r.ok) showToast('✅ Dados salvos no Google Drive!', 'ok');
+    else showToast('❌ Erro ao salvar. Tente novamente.', 'error');
+  }
+
+  const colors = { idle:'#888', loading:'#f59e0b', saving:'#f59e0b', ok:'#0a6b3c', error:'#b91c1c' };
+  const labels = { idle:'Aguardando', loading:'Carregando dados...', saving:'Salvando...', ok:'Sincronizado ✅', error:'Erro de conexão ❌' };
+
+  const nProds = Object.keys(state.products||{}).length;
+  const nMovs = (state.movs||[]).length;
+  const nDevs = (state.devolucoes||[]).length;
+  const nKits = (state.kits||[]).length;
+
+  return (
+    <div>
+      <div style={{ fontSize:20,fontWeight:800,marginBottom:16 }}>☁ Google Drive</div>
+
+      {/* STATUS */}
+      <div style={{ background:'#fff',border:`2px solid ${colors[driveStatus]}`,borderRadius:10,padding:22,marginBottom:16 }}>
+        <div style={{ display:'flex',alignItems:'center',gap:12,marginBottom:16 }}>
+          <div style={{ width:14,height:14,borderRadius:'50%',background:colors[driveStatus],flexShrink:0 }} />
+          <div>
+            <div style={{ fontWeight:800,fontSize:16,color:colors[driveStatus] }}>{labels[driveStatus]}</div>
+            <div style={{ fontSize:12,color:'#999',marginTop:2,fontFamily:'monospace' }}>
+              {lastSync ? `Último sync: ${lastSync.toLocaleString('pt-BR')}` : 'Nunca sincronizado'}
+            </div>
+          </div>
+        </div>
+        <div style={{ display:'grid',gridTemplateColumns:'repeat(4,1fr)',gap:10,marginBottom:16 }}>
+          {[['Produtos',nProds],['Kits',nKits],['Movimentações',nMovs],['Devoluções',nDevs]].map(([lbl,val]) => (
+            <div key={lbl} style={{ background:'#f4f3ef',borderRadius:8,padding:'12px',textAlign:'center' }}>
+              <div style={{ fontSize:22,fontWeight:800 }}>{val}</div>
+              <div style={{ fontSize:11,color:'#5a5950',fontWeight:600,marginTop:2 }}>{lbl}</div>
+            </div>
+          ))}
+        </div>
+        <button onClick={forceSave} disabled={syncing} style={{ width:'100%',padding:'13px',fontSize:15,fontWeight:800,borderRadius:8,border:'none',background: syncing ? '#ccc' : '#0a6b3c',color:'#fff',cursor:syncing?'not-allowed':'pointer' }}>
+          {syncing ? '⏳ Salvando...' : '☁ Salvar agora no Google Drive'}
+        </button>
+      </div>
+
+      {/* INFO */}
+      <div style={{ background:'#e8eeff',border:'1px solid #b3c4f8',borderRadius:10,padding:18 }}>
+        <div style={{ fontWeight:800,fontSize:14,color:'#1a4fcc',marginBottom:10 }}>💡 Como funciona</div>
+        <div style={{ fontSize:13,color:'#1a4fcc',lineHeight:1.7 }}>
+          Os dados são salvos automaticamente no arquivo <strong>{FILE_NAME}</strong> no seu Google Drive.<br/>
+          Ao abrir este sistema em qualquer dispositivo (celular, computador, tablet), os dados são carregados automaticamente — sem precisar de backup manual.<br/><br/>
+          O salvamento automático acontece <strong>1,5 segundos</strong> após cada alteração.
+        </div>
+      </div>
+    </div>
+  );
+}
