@@ -1,11 +1,13 @@
 // ============================================================
 //  4A Loja — Backend Mercado Livre
-//  Hospede no Render: https://render.com
+//  Token persistente em disco (não perde ao reiniciar)
 // ============================================================
 
 const express = require('express');
 const axios   = require('axios');
 const cors    = require('cors');
+const fs      = require('fs');
+const path    = require('path');
 
 const app = express();
 app.use(express.json());
@@ -21,7 +23,10 @@ const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const REDIRECT_URI     = process.env.REDIRECT_URI;
 const PORT             = process.env.PORT || 3000;
 
-// ── TOKEN (em memória) ───────────────────────────────────────
+// Salva token em /opt/render/project/src/.token.json (persistente no Render)
+const TOKEN_FILE = path.join('/opt/render/project/src', '.token.json');
+
+// ── TOKEN PERSISTENTE ─────────────────────────────────────────
 let tokenData = {
   access_token:  null,
   refresh_token: null,
@@ -29,12 +34,38 @@ let tokenData = {
   user_id:       null,
 };
 
-// ── HELPERS ──────────────────────────────────────────────────
+// Carrega token do disco ao iniciar
+function carregarToken() {
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      const raw = fs.readFileSync(TOKEN_FILE, 'utf8');
+      tokenData = JSON.parse(raw);
+      console.log('✅ Token carregado do disco. User ID:', tokenData.user_id);
+    }
+  } catch(e) {
+    console.log('⚠ Não foi possível carregar token:', e.message);
+  }
+}
+
+function salvarToken(data) {
+  tokenData.access_token  = data.access_token  || tokenData.access_token;
+  tokenData.refresh_token = data.refresh_token || tokenData.refresh_token;
+  tokenData.user_id       = data.user_id       || tokenData.user_id;
+  tokenData.expires_at    = Date.now() + (data.expires_in || 21600) * 1000;
+  try {
+    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData), 'utf8');
+    console.log('✅ Token salvo no disco. User ID:', tokenData.user_id);
+  } catch(e) {
+    console.log('⚠ Erro ao salvar token no disco:', e.message);
+  }
+}
+
 async function refreshTokenSeNecessario() {
   if (!tokenData.refresh_token) throw new Error('Não autenticado. Acesse /auth/ml primeiro.');
   const agora = Date.now();
-  if (tokenData.expires_at && agora < tokenData.expires_at - 60_000) return;
+  if (tokenData.expires_at && agora < tokenData.expires_at - 60_000) return; // ainda válido
 
+  console.log('🔄 Renovando token ML...');
   const res = await axios.post('https://api.mercadolibre.com/oauth/token', {
     grant_type:    'refresh_token',
     client_id:     ML_CLIENT_ID,
@@ -42,14 +73,7 @@ async function refreshTokenSeNecessario() {
     refresh_token: tokenData.refresh_token,
   });
   salvarToken(res.data);
-}
-
-function salvarToken(data) {
-  tokenData.access_token  = data.access_token;
-  tokenData.refresh_token = data.refresh_token;
-  tokenData.user_id       = data.user_id;
-  tokenData.expires_at    = Date.now() + data.expires_in * 1000;
-  console.log('✅ Token ML salvo. User ID:', tokenData.user_id);
+  console.log('✅ Token renovado com sucesso!');
 }
 
 function mlApi() {
@@ -69,6 +93,17 @@ function calcDataDespacho(dataBase, diasUteis) {
   }
   return dt.toLocaleDateString('pt-BR');
 }
+
+// Auto-renovação a cada 5 horas (token ML dura 6h)
+setInterval(async () => {
+  if (!tokenData.refresh_token) return;
+  try {
+    await refreshTokenSeNecessario();
+    console.log('🔄 Auto-renovação do token ML OK');
+  } catch(e) {
+    console.log('⚠ Erro na auto-renovação:', e.message);
+  }
+}, 5 * 60 * 60 * 1000);
 
 // ── ROTAS DE AUTENTICAÇÃO ─────────────────────────────────────
 
@@ -134,7 +169,6 @@ app.get('/pedidos', async (req, res) => {
     });
 
     const pedidos = await Promise.all((resp.data.results || []).map(async p => {
-      // Buscar detalhes do envio para pegar data limite de despacho
       let dataDespacho = null;
       let dataDespachoTs = null;
 
@@ -143,48 +177,44 @@ app.get('/pedidos', async (req, res) => {
           const shipResp = await api.get(`/shipments/${p.shipping.id}`);
           const ship = shipResp.data;
 
-          // Tenta pegar a data limite de handling do envio
           if (ship.shipping_option?.estimated_handling_limit?.date) {
             const d = new Date(ship.shipping_option.estimated_handling_limit.date);
             dataDespacho = d.toLocaleDateString('pt-BR');
             dataDespachoTs = d.getTime();
           } else if (ship.lead_time?.handling?.unit === 'hour') {
-            // handling em horas
             const horas = ship.lead_time.handling.value || 24;
             const dt = new Date(new Date(p.date_created).getTime() + horas * 3600000);
             dataDespacho = dt.toLocaleDateString('pt-BR');
             dataDespachoTs = dt.getTime();
           } else if (ship.lead_time?.handling?.value) {
-            // handling em dias
             dataDespacho = calcDataDespacho(p.date_created, ship.lead_time.handling.value);
-            dataDespachoTs = new Date(dataDespacho.split('/').reverse().join('-')).getTime();
+            dataDespachoTs = new Date(p.date_created).getTime() + ship.lead_time.handling.value * 86400000;
           }
         }
       } catch(e) {
         console.log('Erro ao buscar envio:', e.message);
       }
 
-      // Fallback: 3 dias úteis
       if (!dataDespacho) {
         dataDespacho = calcDataDespacho(p.date_created, 3);
         dataDespachoTs = new Date(p.date_created).getTime() + 3 * 86400000;
       }
 
       return {
-        id:             p.id,
-        status:         p.status,
-        data:           new Date(p.date_created).toLocaleDateString('pt-BR'),
-        dataTs:         new Date(p.date_created).getTime(),
-        total:          p.total_amount,
-        itens:          p.order_items.map(i => ({
-          titulo:       i.item.title,
-          sku:          i.item.seller_sku || '',
-          quantidade:   i.quantity,
-          preco:        i.unit_price,
+        id:            p.id,
+        status:        p.status,
+        data:          new Date(p.date_created).toLocaleDateString('pt-BR'),
+        dataTs:        new Date(p.date_created).getTime(),
+        total:         p.total_amount,
+        itens:         p.order_items.map(i => ({
+          titulo:      i.item.title,
+          sku:         i.item.seller_sku || '',
+          quantidade:  i.quantity,
+          preco:       i.unit_price,
         })),
-        comprador:      p.buyer?.nickname || '',
-        envio_id:       p.shipping?.id || null,
-        data_despacho:  dataDespacho,
+        comprador:     p.buyer?.nickname || '',
+        envio_id:      p.shipping?.id || null,
+        data_despacho: dataDespacho,
         dataDespachoTs,
       };
     }));
@@ -266,7 +296,9 @@ app.patch('/anuncios/:itemId/estoque', async (req, res) => {
 
 // ── ROTA DE SAÚDE ─────────────────────────────────────────────
 app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: '4A Loja — ML Backend', versao: '2.0.0' });
+  res.json({ status: 'ok', app: '4A Loja — ML Backend', versao: '3.0.0' });
 });
 
+// ── INICIALIZAÇÃO ─────────────────────────────────────────────
+carregarToken(); // carrega token salvo ao iniciar
 app.listen(PORT, () => console.log(`🚀 Backend rodando na porta ${PORT}`));
