@@ -9,7 +9,11 @@ const cors    = require('cors');
 
 const app = express();
 app.use(express.json());
-app.use(cors()); // permite o HTML local chamar o backend
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PATCH', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
 // ── CONFIGURAÇÕES ────────────────────────────────────────────
 // Coloque estas variáveis no painel do Railway → Variables
