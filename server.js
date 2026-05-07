@@ -1,6 +1,6 @@
 // ============================================================
-//  4A Loja — Backend Mercado Livre
-//  Token persistente em disco (não perde ao reiniciar)
+//  4A Loja — Backend Mercado Livre v4.0
+//  Webhooks automáticos: pago, cancelado, devolução
 // ============================================================
 
 const express = require('express');
@@ -23,28 +23,34 @@ const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
 const REDIRECT_URI     = process.env.REDIRECT_URI;
 const PORT             = process.env.PORT || 3000;
 
-// Salva token em /opt/render/project/src/.token.json (persistente no Render)
-const TOKEN_FILE = path.join('/opt/render/project/src', '.token.json');
+const TOKEN_FILE  = path.join('/opt/render/project/src', '.token.json');
+const EVENTOS_FILE = path.join('/opt/render/project/src', '.eventos.json');
 
 // ── TOKEN PERSISTENTE ─────────────────────────────────────────
-let tokenData = {
-  access_token:  null,
-  refresh_token: null,
-  expires_at:    null,
-  user_id:       null,
-};
+let tokenData = { access_token: null, refresh_token: null, expires_at: null, user_id: null };
 
-// Carrega token do disco ao iniciar
+// Fila de eventos recebidos pelo webhook (lidos pelo HTML)
+let filaEventos = [];
+
 function carregarToken() {
   try {
     if (fs.existsSync(TOKEN_FILE)) {
-      const raw = fs.readFileSync(TOKEN_FILE, 'utf8');
-      tokenData = JSON.parse(raw);
-      console.log('✅ Token carregado do disco. User ID:', tokenData.user_id);
+      tokenData = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
+      console.log('✅ Token carregado. User ID:', tokenData.user_id);
     }
-  } catch(e) {
-    console.log('⚠ Não foi possível carregar token:', e.message);
-  }
+  } catch(e) { console.log('⚠ Erro ao carregar token:', e.message); }
+}
+
+function carregarEventos() {
+  try {
+    if (fs.existsSync(EVENTOS_FILE)) {
+      filaEventos = JSON.parse(fs.readFileSync(EVENTOS_FILE, 'utf8'));
+    }
+  } catch(e) { filaEventos = []; }
+}
+
+function salvarEventos() {
+  try { fs.writeFileSync(EVENTOS_FILE, JSON.stringify(filaEventos.slice(-200)), 'utf8'); } catch(e) {}
 }
 
 function salvarToken(data) {
@@ -52,28 +58,18 @@ function salvarToken(data) {
   tokenData.refresh_token = data.refresh_token || tokenData.refresh_token;
   tokenData.user_id       = data.user_id       || tokenData.user_id;
   tokenData.expires_at    = Date.now() + (data.expires_in || 21600) * 1000;
-  try {
-    fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData), 'utf8');
-    console.log('✅ Token salvo no disco. User ID:', tokenData.user_id);
-  } catch(e) {
-    console.log('⚠ Erro ao salvar token no disco:', e.message);
-  }
+  try { fs.writeFileSync(TOKEN_FILE, JSON.stringify(tokenData), 'utf8'); } catch(e) {}
 }
 
 async function refreshTokenSeNecessario() {
-  if (!tokenData.refresh_token) throw new Error('Não autenticado. Acesse /auth/ml primeiro.');
-  const agora = Date.now();
-  if (tokenData.expires_at && agora < tokenData.expires_at - 60_000) return; // ainda válido
-
-  console.log('🔄 Renovando token ML...');
+  if (!tokenData.refresh_token) throw new Error('Não autenticado.');
+  if (tokenData.expires_at && Date.now() < tokenData.expires_at - 60_000) return;
   const res = await axios.post('https://api.mercadolibre.com/oauth/token', {
-    grant_type:    'refresh_token',
-    client_id:     ML_CLIENT_ID,
-    client_secret: ML_CLIENT_SECRET,
-    refresh_token: tokenData.refresh_token,
+    grant_type: 'refresh_token', client_id: ML_CLIENT_ID,
+    client_secret: ML_CLIENT_SECRET, refresh_token: tokenData.refresh_token,
   });
   salvarToken(res.data);
-  console.log('✅ Token renovado com sucesso!');
+  console.log('🔄 Token renovado!');
 }
 
 function mlApi() {
@@ -83,7 +79,6 @@ function mlApi() {
   });
 }
 
-// Calcula data de despacho em dias úteis
 function calcDataDespacho(dataBase, diasUteis) {
   const dt = new Date(dataBase);
   let dias = 0;
@@ -94,48 +89,163 @@ function calcDataDespacho(dataBase, diasUteis) {
   return dt.toLocaleDateString('pt-BR');
 }
 
-// Auto-renovação a cada 5 horas (token ML dura 6h)
+// Auto-renovação a cada 5 horas
 setInterval(async () => {
   if (!tokenData.refresh_token) return;
+  try { await refreshTokenSeNecessario(); } catch(e) { console.log('⚠ Auto-renovação falhou:', e.message); }
+}, 5 * 60 * 60 * 1000);
+
+// ── WEBHOOK DO MERCADO LIVRE ──────────────────────────────────
+// O ML chama esta rota automaticamente quando algo muda
+app.post('/webhook', async (req, res) => {
+  // ML exige resposta 200 imediata
+  res.sendStatus(200);
+
+  const { topic, resource, user_id } = req.body;
+  console.log('📩 Webhook recebido:', topic, resource);
+
+  if (!topic || !resource) return;
+
   try {
     await refreshTokenSeNecessario();
-    console.log('🔄 Auto-renovação do token ML OK');
+    const api = mlApi();
+
+    // ── PEDIDO mudou de status ──
+    if (topic === 'orders_v2' || topic === 'orders') {
+      const orderId = resource.replace('/orders/', '').split('?')[0];
+      const orderResp = await api.get(`/orders/${orderId}`);
+      const p = orderResp.data;
+
+      // Buscar data de despacho
+      let dataDespacho = null;
+      let dataDespachoTs = null;
+      try {
+        if (p.shipping?.id) {
+          const ship = (await api.get(`/shipments/${p.shipping.id}`)).data;
+          if (ship.shipping_option?.estimated_handling_limit?.date) {
+            const d = new Date(ship.shipping_option.estimated_handling_limit.date);
+            dataDespacho = d.toLocaleDateString('pt-BR');
+            dataDespachoTs = d.getTime();
+          } else if (ship.lead_time?.handling?.value) {
+            dataDespacho = calcDataDespacho(p.date_created, ship.lead_time.handling.value);
+            dataDespachoTs = new Date(p.date_created).getTime() + ship.lead_time.handling.value * 86400000;
+          }
+        }
+      } catch(e) {}
+      if (!dataDespacho) {
+        dataDespacho = calcDataDespacho(p.date_created, 3);
+        dataDespachoTs = new Date(p.date_created).getTime() + 3 * 86400000;
+      }
+
+      const evento = {
+        tipo: 'pedido',
+        acao: p.status, // paid, cancelled, etc
+        ts: Date.now(),
+        pedido: {
+          id:            p.id,
+          status:        p.status,
+          data:          new Date(p.date_created).toLocaleDateString('pt-BR'),
+          dataTs:        new Date(p.date_created).getTime(),
+          total:         p.total_amount,
+          itens:         p.order_items.map(i => ({
+            titulo:      i.item.title,
+            sku:         i.item.seller_sku || '',
+            quantidade:  i.quantity,
+            preco:       i.unit_price,
+          })),
+          comprador:     p.buyer?.nickname || '',
+          envio_id:      p.shipping?.id || null,
+          data_despacho: dataDespacho,
+          dataDespachoTs,
+        }
+      };
+      filaEventos.push(evento);
+      salvarEventos();
+      console.log(`✅ Pedido #${p.id} → ${p.status}`);
+    }
+
+    // ── DEVOLUÇÃO / RECLAMAÇÃO ──
+    if (topic === 'claims') {
+      const claimId = resource.replace('/post-sale/v2/claims/', '').split('?')[0];
+      const claimResp = await api.get(`/post-sale/v2/claims/${claimId}`);
+      const c = claimResp.data;
+
+      // Buscar dados do pedido original
+      let pedidoInfo = null;
+      try {
+        if (c.resource_id) {
+          const ord = (await api.get(`/orders/${c.resource_id}`)).data;
+          pedidoInfo = {
+            itens: ord.order_items.map(i => ({
+              titulo: i.item.title,
+              sku: i.item.seller_sku || '',
+              quantidade: i.quantity,
+              preco: i.unit_price,
+            })),
+            total: ord.total_amount,
+            comprador: ord.buyer?.nickname || '',
+          };
+        }
+      } catch(e) {}
+
+      const evento = {
+        tipo: 'devolucao',
+        acao: c.status,
+        ts: Date.now(),
+        claim: {
+          id:       c.id,
+          status:   c.status,
+          motivo:   c.reason_id || 'Não informado',
+          tipo:     c.type,
+          data:     new Date(c.date_created).toLocaleDateString('pt-BR'),
+          pedidoId: c.resource_id,
+          ...pedidoInfo,
+        }
+      };
+      filaEventos.push(evento);
+      salvarEventos();
+      console.log(`↩ Devolução #${c.id} → ${c.status}`);
+    }
+
   } catch(e) {
-    console.log('⚠ Erro na auto-renovação:', e.message);
+    console.error('⚠ Erro ao processar webhook:', e.message);
   }
-}, 5 * 60 * 60 * 1000);
+});
+
+// ── ROTA PARA O HTML BUSCAR EVENTOS NOVOS ────────────────────
+// O HTML faz polling a cada 30s nesta rota
+app.get('/eventos', (req, res) => {
+  const desde = parseInt(req.query.desde) || 0;
+  const novos = filaEventos.filter(e => e.ts > desde);
+  res.json({ eventos: novos, total: filaEventos.length });
+});
+
+// Limpar eventos antigos (>7 dias)
+app.delete('/eventos', (req, res) => {
+  const limite = Date.now() - 7 * 86400000;
+  filaEventos = filaEventos.filter(e => e.ts > limite);
+  salvarEventos();
+  res.json({ ok: true, restantes: filaEventos.length });
+});
 
 // ── ROTAS DE AUTENTICAÇÃO ─────────────────────────────────────
 
 app.get('/auth/ml', (req, res) => {
-  const url =
-    `https://auth.mercadolivre.com.br/authorization` +
-    `?response_type=code` +
-    `&client_id=${ML_CLIENT_ID}` +
-    `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
+  const url = `https://auth.mercadolivre.com.br/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
   res.redirect(url);
 });
 
 app.get('/callback', async (req, res) => {
   const { code } = req.query;
   if (!code) return res.status(400).send('❌ Code não recebido.');
-
   try {
     const resp = await axios.post('https://api.mercadolibre.com/oauth/token', {
-      grant_type:    'authorization_code',
-      client_id:     ML_CLIENT_ID,
-      client_secret: ML_CLIENT_SECRET,
-      code,
-      redirect_uri:  REDIRECT_URI,
+      grant_type: 'authorization_code', client_id: ML_CLIENT_ID,
+      client_secret: ML_CLIENT_SECRET, code, redirect_uri: REDIRECT_URI,
     });
     salvarToken(resp.data);
-    res.send(`
-      <h2 style="font-family:sans-serif;color:green">✅ Mercado Livre conectado!</h2>
-      <p style="font-family:sans-serif">Pode fechar esta aba e voltar para o sistema 4A Loja.</p>
-      <script>setTimeout(()=>window.close(),3000)</script>
-    `);
+    res.send(`<h2 style="font-family:sans-serif;color:green">✅ Mercado Livre conectado!</h2><p style="font-family:sans-serif">Pode fechar esta aba.</p><script>setTimeout(()=>window.close(),3000)</script>`);
   } catch (e) {
-    console.error(e.response?.data || e.message);
     res.status(500).send('❌ Erro: ' + (e.response?.data?.message || e.message));
   }
 });
@@ -144,161 +254,84 @@ app.get('/status', (req, res) => {
   res.json({
     conectado: !!tokenData.access_token,
     user_id:   tokenData.user_id,
-    expira_em: tokenData.expires_at
-      ? new Date(tokenData.expires_at).toLocaleString('pt-BR')
-      : null,
+    expira_em: tokenData.expires_at ? new Date(tokenData.expires_at).toLocaleString('pt-BR') : null,
   });
 });
 
-// ── ROTAS DE PEDIDOS ──────────────────────────────────────────
+// ── PEDIDOS ───────────────────────────────────────────────────
 
 app.get('/pedidos', async (req, res) => {
   try {
     await refreshTokenSeNecessario();
-    const api    = mlApi();
+    const api = mlApi();
     const limite = parseInt(req.query.limite) || 50;
     const offset = parseInt(req.query.offset) || 0;
-
     const resp = await api.get(`/orders/search`, {
-      params: {
-        seller: tokenData.user_id,
-        sort:   'date_desc',
-        limit:  limite,
-        offset,
-      },
+      params: { seller: tokenData.user_id, sort: 'date_desc', limit: limite, offset },
     });
-
     const pedidos = await Promise.all((resp.data.results || []).map(async p => {
-      let dataDespacho = null;
-      let dataDespachoTs = null;
-
+      let dataDespacho = null, dataDespachoTs = null;
       try {
         if (p.shipping?.id) {
-          const shipResp = await api.get(`/shipments/${p.shipping.id}`);
-          const ship = shipResp.data;
-
+          const ship = (await api.get(`/shipments/${p.shipping.id}`)).data;
           if (ship.shipping_option?.estimated_handling_limit?.date) {
             const d = new Date(ship.shipping_option.estimated_handling_limit.date);
-            dataDespacho = d.toLocaleDateString('pt-BR');
-            dataDespachoTs = d.getTime();
-          } else if (ship.lead_time?.handling?.unit === 'hour') {
-            const horas = ship.lead_time.handling.value || 24;
-            const dt = new Date(new Date(p.date_created).getTime() + horas * 3600000);
-            dataDespacho = dt.toLocaleDateString('pt-BR');
-            dataDespachoTs = dt.getTime();
+            dataDespacho = d.toLocaleDateString('pt-BR'); dataDespachoTs = d.getTime();
           } else if (ship.lead_time?.handling?.value) {
             dataDespacho = calcDataDespacho(p.date_created, ship.lead_time.handling.value);
             dataDespachoTs = new Date(p.date_created).getTime() + ship.lead_time.handling.value * 86400000;
           }
         }
-      } catch(e) {
-        console.log('Erro ao buscar envio:', e.message);
-      }
-
-      if (!dataDespacho) {
-        dataDespacho = calcDataDespacho(p.date_created, 3);
-        dataDespachoTs = new Date(p.date_created).getTime() + 3 * 86400000;
-      }
-
+      } catch(e) {}
+      if (!dataDespacho) { dataDespacho = calcDataDespacho(p.date_created, 3); dataDespachoTs = new Date(p.date_created).getTime() + 3 * 86400000; }
       return {
-        id:            p.id,
-        status:        p.status,
-        data:          new Date(p.date_created).toLocaleDateString('pt-BR'),
-        dataTs:        new Date(p.date_created).getTime(),
-        total:         p.total_amount,
-        itens:         p.order_items.map(i => ({
-          titulo:      i.item.title,
-          sku:         i.item.seller_sku || '',
-          quantidade:  i.quantity,
-          preco:       i.unit_price,
-        })),
-        comprador:     p.buyer?.nickname || '',
-        envio_id:      p.shipping?.id || null,
-        data_despacho: dataDespacho,
-        dataDespachoTs,
+        id: p.id, status: p.status,
+        data: new Date(p.date_created).toLocaleDateString('pt-BR'),
+        dataTs: new Date(p.date_created).getTime(),
+        total: p.total_amount,
+        itens: p.order_items.map(i => ({ titulo: i.item.title, sku: i.item.seller_sku || '', quantidade: i.quantity, preco: i.unit_price })),
+        comprador: p.buyer?.nickname || '', envio_id: p.shipping?.id || null,
+        data_despacho: dataDespacho, dataDespachoTs,
       };
     }));
-
     res.json({ total: resp.data.paging?.total || 0, pedidos });
-  } catch (e) {
-    console.error(e.response?.data || e.message);
-    res.status(500).json({ erro: e.message });
-  }
+  } catch (e) { res.status(500).json({ erro: e.message }); }
 });
 
-app.get('/pedidos/:id', async (req, res) => {
-  try {
-    await refreshTokenSeNecessario();
-    const resp = await mlApi().get(`/orders/${req.params.id}`);
-    res.json(resp.data);
-  } catch (e) {
-    res.status(500).json({ erro: e.message });
-  }
-});
-
-// ── ROTAS DE ANÚNCIOS / ESTOQUE ───────────────────────────────
+// ── ANÚNCIOS ──────────────────────────────────────────────────
 
 app.get('/anuncios', async (req, res) => {
   try {
     await refreshTokenSeNecessario();
-    const api    = mlApi();
-    const limite = parseInt(req.query.limite) || 50;
-
-    const idsResp = await api.get(`/users/${tokenData.user_id}/items/search`, {
-      params: { limit: limite },
-    });
+    const api = mlApi();
+    const idsResp = await api.get(`/users/${tokenData.user_id}/items/search`, { params: { limit: parseInt(req.query.limite) || 50 } });
     const ids = idsResp.data.results || [];
     if (!ids.length) return res.json([]);
-
     const chunks = [];
     for (let i = 0; i < ids.length; i += 20) chunks.push(ids.slice(i, i + 20));
-
     const anuncios = [];
     for (const chunk of chunks) {
       const r = await api.get('/items', { params: { ids: chunk.join(',') } });
-      r.data.forEach(item => {
-        if (item.code === 200) {
-          const b = item.body;
-          anuncios.push({
-            id:         b.id,
-            titulo:     b.title,
-            sku:        b.seller_sku || '',
-            preco:      b.price,
-            quantidade: b.available_quantity,
-            status:     b.status,
-            permalink:  b.permalink,
-          });
-        }
-      });
+      r.data.forEach(item => { if (item.code === 200) { const b = item.body; anuncios.push({ id: b.id, titulo: b.title, sku: b.seller_sku || '', preco: b.price, quantidade: b.available_quantity, status: b.status, permalink: b.permalink }); } });
     }
     res.json(anuncios);
-  } catch (e) {
-    console.error(e.response?.data || e.message);
-    res.status(500).json({ erro: e.message });
-  }
+  } catch (e) { res.status(500).json({ erro: e.message }); }
 });
 
 app.patch('/anuncios/:itemId/estoque', async (req, res) => {
   const { quantidade } = req.body;
   if (quantidade === undefined) return res.status(400).json({ erro: 'Informe "quantidade".' });
-
   try {
     await refreshTokenSeNecessario();
-    const resp = await mlApi().put(`/items/${req.params.itemId}`, {
-      available_quantity: quantidade,
-    });
+    const resp = await mlApi().put(`/items/${req.params.itemId}`, { available_quantity: quantidade });
     res.json({ ok: true, quantidade_atualizada: resp.data.available_quantity });
-  } catch (e) {
-    console.error(e.response?.data || e.message);
-    res.status(500).json({ erro: e.response?.data?.message || e.message });
-  }
+  } catch (e) { res.status(500).json({ erro: e.response?.data?.message || e.message }); }
 });
 
-// ── ROTA DE SAÚDE ─────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.json({ status: 'ok', app: '4A Loja — ML Backend', versao: '3.0.0' });
-});
+// ── SAÚDE ─────────────────────────────────────────────────────
+app.get('/', (req, res) => res.json({ status: 'ok', app: '4A Loja — ML Backend', versao: '4.0.0' }));
 
-// ── INICIALIZAÇÃO ─────────────────────────────────────────────
-carregarToken(); // carrega token salvo ao iniciar
+// ── INIT ──────────────────────────────────────────────────────
+carregarToken();
+carregarEventos();
 app.listen(PORT, () => console.log(`🚀 Backend rodando na porta ${PORT}`));
