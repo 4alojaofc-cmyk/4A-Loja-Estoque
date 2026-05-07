@@ -61,7 +61,7 @@ function mlApi() {
 // 1) Redireciona para o login do Mercado Livre
 app.get('/auth/ml', (req, res) => {
   const url =
-    `https://auth.mercadolibre.com.br/authorization` +
+    `https://auth.mercadolivre.com.br/authorization` +
     `?response_type=code` +
     `&client_id=${ML_CLIENT_ID}` +
     `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`;
