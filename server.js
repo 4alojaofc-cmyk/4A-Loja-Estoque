@@ -13,9 +13,9 @@ app.use(cors()); // permite o HTML local chamar o backend
 
 // ── CONFIGURAÇÕES ────────────────────────────────────────────
 // Coloque estas variáveis no painel do Railway → Variables
-const ML_CLIENT_ID     = process.env.ML_CLIENT_ID     || 'SEU_CLIENT_ID';
-const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET || 'SEU_CLIENT_SECRET';
-const REDIRECT_URI     = process.env.REDIRECT_URI     || 'https://SEU-APP.railway.app/callback';
+const ML_CLIENT_ID     = process.env.ML_CLIENT_ID;
+const ML_CLIENT_SECRET = process.env.ML_CLIENT_SECRET;
+const REDIRECT_URI     = process.env.REDIRECT_URI;
 const PORT             = process.env.PORT             || 3000;
 
 // ── TOKEN (em memória — use Redis ou banco em produção) ──────
